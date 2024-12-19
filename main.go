@@ -1,14 +1,14 @@
 package main
 
 import (
-	"errors"
+	"flag"
 	"fmt"
 	"github.com/docker/docker/api/types/filters"
+	"gopkg.in/yaml.v3"
 	"log"
+	"math"
 	"net/http"
 	"os"
-	"strconv"
-	"strings"
 	"time"
 
 	"context"
@@ -18,113 +18,88 @@ import (
 	"github.com/docker/docker/client"
 )
 
-type Container struct {
-	ID           string `json:"id"`
-	Name         string `json:"name"`
-	RestartCount int    `json:"restart_count"`
+type RestartRecord struct {
+	ContainerID  string
+	RestartCount int
+	RestartTime  time.Time
+	Restarting   bool
 }
 
-// Containers 自定义类型，并为该类型添加方法
-type Containers []Container
+type RestartRecords []RestartRecord
 
-// 采用指针接收者避免复制Containers结构体
-func (c *Containers) check(id string) bool {
-	for _, v := range *c {
-		if v.ID == id {
+func (r *RestartRecords) Len() int {
+	return len(*r)
+}
+
+func (r *RestartRecords) Check(id string) bool {
+	for _, restart := range *r {
+		if restart.ContainerID == id {
 			return true
 		}
 	}
 	return false
 }
 
-func (c *Containers) getRestartCount(id string) int {
-	for _, v := range *c {
-		if v.ID == id {
-			return v.RestartCount
-		}
-	}
-	return 0
+func (r *RestartRecords) Add(id string, rc int, rt time.Time) {
+	*r = append(*r, RestartRecord{ContainerID: id, RestartCount: rc, RestartTime: rt})
 }
 
-func (c *Containers) getContainer(id string) (*Container, bool) {
-	for i := range *c {
-		if (*c)[i].ID == id {
-			return &(*c)[i], true
+func (r *RestartRecords) Get(id string) *RestartRecord {
+	for _, restart := range *r {
+		if restart.ContainerID == id {
+			return &restart
 		}
 	}
-	return nil, false
+	return nil
 }
 
-func (c *Containers) getContainerByName(n string) (*Container, bool) {
-	for i := range *c {
-		if (*c)[i].Name == n {
-			return &(*c)[i], true
-		}
-	}
-	return nil, false
+var restartRecords *RestartRecords
+
+type Server struct {
+	Port             string  `yaml:"port"`
+	DockerAPIVersion string  `yaml:"docker_api_version"`
+	GinMode          string  `yaml:"gin_mode"`
+	Interval         int     `yaml:"interval"`
+	ResetBackoff     float64 `yaml:"reset_backoff"`
+	BaseBackoff      float64 `yaml:"base_backoff"`
+	MaximumBackoff   float64 `yaml:"maximum_backoff"`
 }
 
-func (c *Containers) updateRestartCount(id string, rc int) error {
-	for i := range *c {
-		if (*c)[i].ID == id {
-			(*c)[i].RestartCount = rc
-			return nil
-		}
-	}
-	return errors.New("container not found")
+type Config struct {
+	Server `yaml:"server"`
 }
 
-// 定义变量
-var (
-	containerRestart   Containers
-	autoHealInterval   = 5
-	dockerApiVersion   = "1.39"
-	autoHealMaxRestart = 3
-)
+var c Config
+var sc Server
 
-// 从环境变量加载配置覆盖默认值
-func loadEnvVars() {
-	if dockerV := os.Getenv("DOCKER_API_VERSION"); dockerV != "" {
-		dockerApiVersion = dockerV
+func loadConfig() {
+	var configFile string
+	flag.StringVar(&configFile, "c", "./config.yml", "config file")
+	flag.Parse()
+
+	yamlFile, err := os.ReadFile(configFile)
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	if interval := os.Getenv("AUTOHEAL_INTERVAL"); interval != "" {
-		if s, err := strconv.Atoi(interval); err == nil {
-			autoHealInterval = s
-		}
+	err = yaml.Unmarshal(yamlFile, &c)
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	if maxRestart := os.Getenv("AUTOHEAL_MAX_RESTART"); maxRestart != "" {
-		if s, err := strconv.Atoi(maxRestart); err == nil {
-			autoHealMaxRestart = s
-		}
-	}
+	sc = c.Server
 
-}
-func serverInfo() {
-	var p string
-	if port := os.Getenv("PORT"); port != "" {
-		p = ":" + port
-	} else {
-		p = ":8080"
-	}
+	gin.SetMode(sc.GinMode)
 
-	ginMode := gin.DebugMode
-	if mode := os.Getenv("GIN_MODE"); mode != "" {
-		ginMode = mode
-	}
-
-	log.Printf("检查间隔: %d s, Docker API Version: %s, 每天最大重启次数: %d, 监听端口: %s, GIN模式: %s\n", autoHealInterval, dockerApiVersion, autoHealMaxRestart, p, ginMode)
-}
-
-func cleanContainers() {
-	log.Println("当前容器列表:", containerRestart)
-	containerRestart = containerRestart[:0]
-	log.Println("容器列表已清空")
+	// 输出配置信息
+	log.Printf("检查异常容器间隔: %d s\n", sc.Interval)
+	log.Printf("检查异常容器间隔: %d s,采用指数退避算法重启\n", sc.Interval)
+	log.Printf("Docker API Version: %s\n", sc.DockerAPIVersion)
+	log.Printf("监听端口: %s, GIN模式: %s\n", ":"+sc.Port, sc.GinMode)
 }
 
 func autoCheck() {
-	apiClient, err := client.NewClientWithOpts(client.FromEnv, client.WithVersion(dockerApiVersion))
+	apiClient, err := client.NewClientWithOpts(client.FromEnv, client.WithVersion(sc.DockerAPIVersion))
 	if err != nil {
 		panic(err)
 	}
@@ -148,30 +123,52 @@ func autoCheck() {
 	for _, ctr := range containers {
 		//	重启异常容器
 		// 添加判断条件，限制每天只能重启指定最大次数
-		if rc := containerRestart.getRestartCount(ctr.ID); rc >= autoHealMaxRestart {
-			log.Printf("%s %s (status: %s) 重启次数已达到最大限制 %d\n", ctr.Names, ctr.ID, ctr.Status, autoHealMaxRestart)
-			continue
-		} else {
-			log.Printf("%s %s (status: %s) 发现unhealthy容器，进行第 %d 次重启\n", ctr.Names, ctr.ID, ctr.Status, rc+1)
+		//if rc := containerRestart.getRestartCount(ctr.ID); rc >= sc.MaxRestart {
+		//	log.Printf("%s %s (status: %s) 重启次数已达到最大限制 %d\n", ctr.Names, ctr.ID, ctr.Status, sc.MaxRestart)
+		//	continue
+		//} else {
+		//	log.Printf("%s %s (status: %s) 发现unhealthy容器，进行第 %d 次重启\n", ctr.Names, ctr.ID, ctr.Status, rc+1)
+		//}
+
+		if !restartRecords.Check(ctr.ID) {
+			if err := apiClient.ContainerRestart(context.Background(), ctr.ID, container.StopOptions{}); err != nil {
+				log.Println(err)
+			}
+			restartRecords.Add(ctr.ID, 0, time.Now())
 		}
 
-		if err := apiClient.ContainerRestart(context.Background(), ctr.ID, container.StopOptions{}); err != nil {
-			log.Println(err)
-		}
+		if restartRecords.Check(ctr.ID) {
+			r := restartRecords.Get(ctr.ID)
+			expireT := r.RestartTime.Add(time.Second * time.Duration(sc.ResetBackoff))
+			// todo: 阻塞问题，是否会多次运行问题
+			if time.Now().Before(expireT) {
+				sleep := math.Min(sc.MaximumBackoff, sc.BaseBackoff*math.Exp2(float64(r.RestartCount)))
+				time.Sleep(time.Duration(sleep) * time.Second)
 
-		// 记录重启次数
-		if c, ok := containerRestart.getContainer(ctr.ID); ok {
-			c.RestartCount += 1
-		} else {
-			newC := Container{Name: strings.Join(ctr.Names, "")[1:], ID: ctr.ID, RestartCount: 1}
-			containerRestart = append(containerRestart, newC)
+				if err := apiClient.ContainerRestart(context.Background(), ctr.ID, container.StopOptions{}); err != nil {
+					log.Println(err)
+				}
+
+				//	指数增加
+				r.RestartCount++
+				r.RestartTime = time.Now()
+
+			} else {
+				// 记录重置
+				r.RestartCount = 0
+				r.RestartTime = time.Now()
+				if err := apiClient.ContainerRestart(context.Background(), ctr.ID, container.StopOptions{}); err != nil {
+					log.Println(err)
+				}
+			}
+
 		}
 	}
 }
 
 func autoHeal() {
 	// 每10秒调用一次 check 函数
-	interval := time.Duration(autoHealInterval) * time.Second
+	interval := time.Duration(sc.Interval) * time.Second
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -180,35 +177,6 @@ func autoHeal() {
 		select {
 		case <-ticker.C: // 每次 ticker 间隔到达时触发
 			autoCheck() // 执行检查函数
-		}
-	}
-}
-
-// 每天定时清理一次
-func cronClean() {
-	// 获取当前时间
-	now := time.Now()
-	// 计算下一个午夜12点的时间点
-	nextMidnight := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
-
-	//计算下一个午夜的时间差
-	durationUntilMidnight := nextMidnight.Sub(now)
-
-	// 等待下一个午夜12点
-	time.Sleep(durationUntilMidnight)
-
-	// 清空容器切片
-	cleanContainers()
-
-	// 每天继续重复清空操作
-	ticker := time.NewTicker(24 * time.Hour)
-	defer ticker.Stop()
-
-	//每经过24小时清空容器列表
-	for {
-		select {
-		case <-ticker.C:
-			cleanContainers()
 		}
 	}
 }
@@ -250,46 +218,43 @@ func setupRouter() *gin.Engine {
 		c.String(http.StatusOK, "pong")
 	})
 
-	// Get container value
-	r.GET("/container/:name", func(c *gin.Context) {
-		name := c.Params.ByName("name")
-		value, ok := containerRestart.getContainerByName(name)
-		if ok {
-			c.JSON(http.StatusOK, value)
-		} else {
-			c.JSON(http.StatusOK, gin.H{"container": name, "status": "no value"})
-		}
-	})
-
-	// Get container list
-	r.GET("/containers", func(c *gin.Context) {
-		if len(containerRestart) == 0 {
-			c.JSON(http.StatusOK, gin.H{"status": "no value"})
-		} else {
-			c.JSON(http.StatusOK, containerRestart)
-		}
-
-	})
+	//// Get container value
+	//r.GET("/container/:name", func(c *gin.Context) {
+	//	name := c.Params.ByName("name")
+	//	value, ok := containerRestart.getContainerByName(name)
+	//	if ok {
+	//		c.JSON(http.StatusOK, value)
+	//	} else {
+	//		c.JSON(http.StatusOK, gin.H{"container": name, "status": "no value"})
+	//	}
+	//})
+	//
+	//// Get container list
+	//r.GET("/containers", func(c *gin.Context) {
+	//	if len(containerRestart) == 0 {
+	//		c.JSON(http.StatusOK, gin.H{"status": "no value"})
+	//	} else {
+	//		c.JSON(http.StatusOK, containerRestart)
+	//	}
+	//
+	//})
 
 	return r
 }
 
-func main() {
-	// 加载环境变量
-	loadEnvVars()
+func init() {
+	restartRecords = new(RestartRecords)
+}
 
-	// 输出配置信息
-	serverInfo()
+func main() {
+	// 加载配置
+	loadConfig()
 
 	// 自动检测unhealthy容器
 	go autoHeal()
 
-	// 每天重置重启记录
-	go cronClean()
-
 	// 启动服务
 	r := setupRouter()
 	// Listen and Server in 0.0.0.0:8080
-	r.Run()
-
+	r.Run(":" + sc.Port)
 }

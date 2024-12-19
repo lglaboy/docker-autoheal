@@ -1,0 +1,15 @@
+server:
+  # 启动端口
+  port: 8080
+  # docker api 版本
+  docker_api_version: 1.39
+  # gin 模式，支持debug release
+  gin_mode: release
+  # 检查间隔（s）
+  interval: 5
+  # 重置回退时间 s
+  reset_backoff: 600
+  # 指数退避基本时间 s
+  base_backoff: 10
+  # 指数退避最大时间 s
+  maximum_backoff: 300
