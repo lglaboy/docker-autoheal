@@ -11,12 +11,10 @@ ENV TZ=Asia/Shanghai \
 RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories \
     && apk add tzdata --no-cache
 
-EXPOSE 8080
-
 WORKDIR /
 
 # autoheal 在宿主机上拥有可执行权限，不需要再次授权
-COPY autoheal /
+COPY autoheal config.yml /
 
 HEALTHCHECK --interval=5s --timeout=3s --start-period=5s \
 CMD pgrep autoheal || exit 1
